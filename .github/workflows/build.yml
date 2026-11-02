@@ -1,0 +1,77 @@
+name: Build MirKey
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore: [ '**.md' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepara la firma
+        env:
+          KEYSTORE_B64: ${{ secrets.MIRKEY_KEYSTORE_B64 }}
+        run: |
+          KS="$RUNNER_TEMP/mirkey.p12"
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$KS"
+            echo "MIRKEY_SIGNING=stabile" >> "$GITHUB_ENV"
+          else
+            # Nessun segreto: firma provvisoria, cambia a ogni build
+            keytool -genkeypair -storetype PKCS12 -keystore "$KS" -alias mirkey -keyalg RSA -keysize 2048 \
+              -validity 10000 -storepass mirkey-store -keypass mirkey-store -dname "CN=MirKey temp"
+            echo "MIRKEY_SIGNING=provvisoria" >> "$GITHUB_ENV"
+          fi
+          echo "MIRKEY_KEYSTORE=$KS" >> "$GITHUB_ENV"
+          echo "MIRKEY_KEYSTORE_PASSWORD=mirkey-store" >> "$GITHUB_ENV"
+          echo "MIRKEY_KEY_ALIAS=mirkey" >> "$GITHUB_ENV"
+
+      - name: Compila l'APK
+        env:
+          MIRKEY_BUILD: ${{ github.run_number }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --stacktrace
+
+      - name: Pubblica la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          cp "$APK" MirKey.apk
+          if [ "$MIRKEY_SIGNING" = "stabile" ]; then
+            NOTE="Firma stabile: si installa sopra la versione precedente."
+          else
+            NOTE="Firma provvisoria: per installarla disinstalla prima la versione precedente."
+          fi
+          gh release create "build-${{ github.run_number }}" MirKey.apk \
+            --title "MirKey build ${{ github.run_number }}" \
+            --notes "$(git log -1 --pretty=%s)
+
+          $NOTE" --latest
+
+      - name: Salva i report in caso di errore
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: '*/build/reports'
